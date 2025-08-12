@@ -1,3 +1,4 @@
+// server/server.js
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -10,61 +11,61 @@ const server = http.createServer(app);
 
 const io = new Server(server, { cors: { origin: "*" } });
 
-const users = {};   // username -> socketId
-const sockets = {}; // socketId -> username
-const rooms = {};   // roomId -> { host, participants: Set<username> }
+// users: username -> Set(socketId)
+// sockets: socketId -> username
+// rooms: roomId -> { host, participants: Set<username> }
+const users = {};
+const sockets = {};
+const rooms = {};
 
 io.on("connection", (socket) => {
   console.log("socket connected:", socket.id);
 
   socket.on("register", (username) => {
     if (!username) return;
-
-    // Agar username already kisi aur socket se registered hai, purane socket ko hatao
-    if (users[username] && users[username] !== socket.id) {
-      const oldSocketId = users[username];
-      delete sockets[oldSocketId];
-      console.log(`Removed old socket ${oldSocketId} for username ${username}`);
-    }
-
-    users[username] = socket.id;
+    if (!users[username]) users[username] = new Set();
+    users[username].add(socket.id);
     sockets[socket.id] = username;
 
+    console.log(`registered: ${username} with socket: ${socket.id}`);
     io.emit("onlineUsers", Object.keys(users));
-    console.log("registered:", username, "with socket:", socket.id);
   });
 
   socket.on("create-room", ({ host, roomId }) => {
     const id = roomId || uuidv4();
-
     if (!rooms[id]) {
       rooms[id] = { host, participants: new Set() };
       console.log(`Room created: ${id} by host ${host}`);
     }
     rooms[id].participants.add(host);
     socket.join(id);
-
     socket.emit("room-created", { roomId: id });
     console.log(`${host} created or joined room ${id}`);
   });
 
-  socket.on("invite-users", ({ roomId, invited, from }) => {
+  socket.on("invite-users", ({ roomId, invited = [], from }) => {
     invited.forEach((username) => {
-      const sid = users[username];
-      if (sid) {
-        io.to(sid).emit("invitation", { roomId, from });
+      const set = users[username];
+      if (set && set.size > 0) {
+        // send to all sockets of that user
+        Array.from(set).forEach((sid) => {
+          io.to(sid).emit("invitation", { roomId, from });
+        });
         console.log(`Invitation sent to ${username} from ${from} for room ${roomId}`);
       } else {
-        const callerSid = users[from];
-        if (callerSid) {
-          io.to(callerSid).emit("userNotAvailable", { username });
-          console.log(`User ${username} not available to invite`);
+        // notify caller that user not available
+        const callerSockets = users[from] ? Array.from(users[from]) : [];
+        if (callerSockets.length > 0) {
+          io.to(callerSockets[0]).emit("userNotAvailable", { username });
         }
+        console.log(`User ${username} not available to invite`);
       }
     });
   });
 
   socket.on("join-room", ({ roomId, username }) => {
+    if (!roomId || !username) return;
+
     if (!rooms[roomId]) {
       rooms[roomId] = { host: username, participants: new Set() };
       console.log(`Room ${roomId} did not exist, created with host ${username}`);
@@ -74,16 +75,21 @@ io.on("connection", (socket) => {
       rooms[roomId].participants.add(username);
       socket.join(roomId);
 
+      // collect all socketIds for participants excluding current socket
       const otherSockets = Array.from(rooms[roomId].participants)
-        .map((u) => users[u])
+        .flatMap((u) => (users[u] ? Array.from(users[u]) : []))
         .filter((sid) => sid && sid !== socket.id);
 
       socket.emit("all-users", otherSockets);
       socket.to(roomId).emit("user-joined", { socketId: socket.id, username });
+
       console.log(`${username} joined room ${roomId}`);
+      console.log(`Room ${roomId} participants:`, Array.from(rooms[roomId].participants));
+      console.log(`Sockets in room ${roomId}:`, otherSockets);
     } else {
+      // re-join case: still send other participants
       const otherSockets = Array.from(rooms[roomId].participants)
-        .map((u) => users[u])
+        .flatMap((u) => (users[u] ? Array.from(users[u]) : []))
         .filter((sid) => sid && sid !== socket.id);
 
       socket.emit("all-users", otherSockets);
@@ -92,17 +98,17 @@ io.on("connection", (socket) => {
   });
 
   socket.on("signal", ({ toSocketId, data }) => {
-    if (!toSocketId) return;
+    if (!toSocketId || !data) return;
     io.to(toSocketId).emit("signal", { from: socket.id, data });
   });
 
   socket.on("leave-room", ({ roomId, username }) => {
+    if (!roomId || !username) return;
     if (rooms[roomId]) {
       rooms[roomId].participants.delete(username);
       socket.leave(roomId);
       socket.to(roomId).emit("user-left", { socketId: socket.id, username });
       console.log(`${username} left room ${roomId}`);
-
       if (rooms[roomId].participants.size === 0) {
         delete rooms[roomId];
         console.log(`Room ${roomId} deleted because empty`);
@@ -112,28 +118,36 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     const username = sockets[socket.id];
+    console.log("disconnect:", socket.id, "username:", username || "unknown");
     if (username) {
-      delete users[username];
+      // remove this socket
+      if (users[username]) {
+        users[username].delete(socket.id);
+        if (users[username].size === 0) {
+          delete users[username];
+        }
+      }
       delete sockets[socket.id];
 
+      // remove user from rooms if they have no sockets left
       Object.keys(rooms).forEach((roomId) => {
         if (rooms[roomId].participants.has(username)) {
-          rooms[roomId].participants.delete(username);
-          socket.to(roomId).emit("user-left", { socketId: socket.id, username });
-          console.log(`${username} disconnected and left room ${roomId}`);
-
-          if (rooms[roomId].participants.size === 0) {
-            delete rooms[roomId];
-            console.log(`Room ${roomId} deleted because empty`);
+          if (!users[username]) {
+            rooms[roomId].participants.delete(username);
+            socket.to(roomId).emit("user-left", { socketId: socket.id, username });
+            console.log(`${username} disconnected and left room ${roomId}`);
+            if (rooms[roomId].participants.size === 0) {
+              delete rooms[roomId];
+              console.log(`Room ${roomId} deleted because empty`);
+            }
           }
         }
       });
 
       io.emit("onlineUsers", Object.keys(users));
     }
-    console.log("disconnected", socket.id);
   });
 });
 
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`Signalling server running on :${PORT}`));
